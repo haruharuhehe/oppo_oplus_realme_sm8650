@@ -134,10 +134,9 @@ jobs:
           rm -f ./ccache &
           
           echo "正在克隆源码仓库..."
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/android_kernel_oneplus_mt6989/archive/refs/heads/oneplus/mt6989_v_15.0.2_ace5_race.zip -o common.zip && 
-          unzip -q common.zip && 
-          mv "android_kernel_oneplus_mt6989-oneplus-mt6989_v_15.0.2_ace5_race" common &&
-          rm -rf common.zip &
+          git clone --depth=1 \
+          https://github.com/realme-kernel-opensource/realme_gt7-AndroidV-kernel-source.git \
+          common
           
           echo "正在克隆llvm-Clang20工具链..." &&
           mkdir -p clang20 &&

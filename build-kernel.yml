@@ -1,0 +1,526 @@
+name: Build Kernel - Realme GT7T (ReSukiSU + SusFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_SOURCE:
+        description: 'Kernel source repo URL'
+        required: true
+        default: 'https://github.com/realme-kernel-opensource/realme_gt7T-AndroidV-kernel-source.git'
+      KERNEL_BRANCH:
+        description: 'Kernel source branch'
+        required: true
+        default: 'main'
+      DEFCONFIG:
+        description: 'Defconfig name (thường là <device>_defconfig)'
+        required: true
+        default: 'gki_defconfig'
+      KERNEL_VERSION:
+        description: 'Kernel version (5.10 / 5.15 / 6.1)'
+        required: true
+        default: '5.15'
+        type: choice
+        options:
+          - '5.10'
+          - '5.15'
+          - '6.1'
+      RESUKISU_BRANCH:
+        description: 'ReSukiSU branch'
+        required: true
+        default: 'main'
+      SUSFS_BRANCH:
+        description: 'SusFS branch (theo kernel version)'
+        required: true
+        default: 'kernel-5.15'
+        type: choice
+        options:
+          - 'kernel-5.10'
+          - 'kernel-5.15'
+          - 'kernel-6.1'
+          - 'kernel-6.6'
+      ANYKERNEL_SOURCE:
+        description: 'AnyKernel3 repo URL'
+        required: true
+        default: 'https://github.com/osm0sis/AnyKernel3.git'
+      ANYKERNEL_BRANCH:
+        description: 'AnyKernel3 branch'
+        required: true
+        default: 'master'
+      CLANG_VERSION:
+        description: 'Clang version (Neutron Clang)'
+        required: true
+        default: 'latest'
+      KERNEL_NAME:
+        description: 'Tên kernel (dùng cho tên file zip)'
+        required: true
+        default: 'GT7T-ReSukiSU-SusFS'
+      CREATE_RELEASE:
+        description: 'Tạo GitHub Release?'
+        required: true
+        default: 'true'
+        type: boolean
+
+env:
+  ARCH: arm64
+  SUBARCH: arm64
+  CROSS_COMPILE: aarch64-linux-gnu-
+  CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+  CLANG_DIR: ${{ github.workspace }}/clang
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  ANYKERNEL_DIR: ${{ github.workspace }}/anykernel3
+  RESUKISU_DIR: ${{ github.workspace }}/kernel/KernelSU
+  OUT_DIR: ${{ github.workspace }}/out
+  TZ: Asia/Ho_Chi_Minh
+
+jobs:
+  build:
+    name: Build Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      # ──────────────────────────────────────────
+      # 1. Setup môi trường
+      # ──────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex git \
+            gnupg gperf imagemagick lib32ncurses5-dev \
+            lib32readline-dev lib32z1-dev liblz4-tool \
+            libncurses5-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush rsync \
+            schedtool squashfs-tools xsltproc zip zlib1g-dev \
+            libelf-dev python3 python3-pip binutils \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            make ninja-build pkg-config
+
+      # ──────────────────────────────────────────
+      # 2. Tải Neutron Clang (toolchain tốt nhất cho MTK)
+      # ──────────────────────────────────────────
+      - name: Download Neutron Clang
+        run: |
+          mkdir -p "$CLANG_DIR"
+          echo "Fetching latest Neutron Clang..."
+
+          # Lấy release mới nhất từ Neutron-Toolchains
+          LATEST=$(curl -s https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
+            | grep "tag_name" | cut -d '"' -f 4)
+
+          echo "Clang version: $LATEST"
+
+          CLANG_URL=$(curl -s https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest \
+            | grep "browser_download_url" | grep ".tar.zst" | head -1 | cut -d '"' -f 4)
+
+          if [ -z "$CLANG_URL" ]; then
+            echo "Neutron Clang .tar.zst not found, trying direct method..."
+            # Fallback: dùng AOSP Clang từ Android CI
+            wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz -O clang.tar.gz || true
+            CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240101-release/Clang-19.0.0git-20240101.tar.gz"
+          fi
+
+          echo "Downloading from: $CLANG_URL"
+          curl -Lo clang.tar.zst "$CLANG_URL" || \
+            curl -Lo clang.tar.gz "$CLANG_URL" || true
+
+          # Extract
+          if [ -f clang.tar.zst ]; then
+            sudo apt-get install -y zstd
+            tar --use-compress-program=unzstd -xf clang.tar.zst -C "$CLANG_DIR"
+          elif [ -f clang.tar.gz ]; then
+            tar -xzf clang.tar.gz -C "$CLANG_DIR"
+          fi
+
+          echo "PATH=$CLANG_DIR/bin:$PATH" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+          echo "LD=ld.lld" >> $GITHUB_ENV
+          echo "AR=llvm-ar" >> $GITHUB_ENV
+          echo "NM=llvm-nm" >> $GITHUB_ENV
+          echo "OBJCOPY=llvm-objcopy" >> $GITHUB_ENV
+          echo "OBJDUMP=llvm-objdump" >> $GITHUB_ENV
+          echo "STRIP=llvm-strip" >> $GITHUB_ENV
+
+          # Verify
+          "$CLANG_DIR/bin/clang" --version || echo "Clang not found, will use system clang"
+
+      # Fallback nếu Neutron Clang thất bại
+      - name: Fallback - Use ZyCromerZ Clang 19
+        if: failure()
+        run: |
+          mkdir -p "$CLANG_DIR"
+          wget -q "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240101-release/Clang-19.0.0git-20240101.tar.gz" \
+            -O clang.tar.gz
+          tar -xzf clang.tar.gz -C "$CLANG_DIR"
+          echo "PATH=$CLANG_DIR/bin:$PATH" >> $GITHUB_ENV
+
+      # ──────────────────────────────────────────
+      # 3. Clone Kernel Source
+      # ──────────────────────────────────────────
+      - name: Clone kernel source
+        run: |
+          echo "Cloning kernel source..."
+          git clone --depth=1 \
+            --branch "${{ github.event.inputs.KERNEL_BRANCH }}" \
+            "${{ github.event.inputs.KERNEL_SOURCE }}" \
+            "$KERNEL_DIR"
+
+          cd "$KERNEL_DIR"
+          echo "KERNEL_VERSION_FULL=$(make kernelversion 2>/dev/null || echo unknown)" >> $GITHUB_ENV
+          echo "Kernel source cloned successfully"
+          ls -la
+
+      # ──────────────────────────────────────────
+      # 4. Tích hợp ReSukiSU
+      # ──────────────────────────────────────────
+      - name: Integrate ReSukiSU
+        run: |
+          cd "$KERNEL_DIR"
+          echo "Setting up ReSukiSU..."
+
+          # Xóa KernelSU cũ nếu có
+          rm -rf drivers/kernelsu drivers/staging/kernelsu KernelSU 2>/dev/null || true
+
+          # Chạy setup script ReSukiSU chính thức
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" \
+            | bash -s "${{ github.event.inputs.RESUKISU_BRANCH }}"
+
+          echo "ReSukiSU version:"
+          cat KernelSU/VERSION 2>/dev/null || echo "VERSION file not found"
+
+          # Kiểm tra driver đã được thêm chưa
+          if [ -d "KernelSU" ]; then
+            echo "✅ ReSukiSU integrated successfully"
+          else
+            echo "❌ ReSukiSU integration failed"
+            exit 1
+          fi
+
+      # ──────────────────────────────────────────
+      # 5. Tích hợp SusFS
+      # ──────────────────────────────────────────
+      - name: Integrate SusFS
+        run: |
+          cd "$KERNEL_DIR"
+          echo "Setting up SusFS..."
+
+          SUSFS_BRANCH="${{ github.event.inputs.SUSFS_BRANCH }}"
+
+          # Clone SusFS repo (ShirkNeko fork - hỗ trợ tốt nhất)
+          git clone --depth=1 \
+            --branch "$SUSFS_BRANCH" \
+            https://github.com/ShirkNeko/susfs4ksu.git \
+            /tmp/susfs4ksu
+
+          # Copy kernel patches
+          cp /tmp/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch \
+             "$KERNEL_DIR/KernelSU/" 2>/dev/null || echo "KSU patch copy skipped"
+
+          # Apply susfs kernel patch
+          KVER="${{ github.event.inputs.KERNEL_VERSION }}"
+          PATCH_FILE="/tmp/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${KVER}.patch"
+
+          if [ -f "$PATCH_FILE" ]; then
+            echo "Applying susfs patch for kernel $KVER..."
+            patch -p1 < "$PATCH_FILE" || {
+              echo "⚠️ Patch failed with -p1, trying -p0..."
+              patch -p0 < "$PATCH_FILE" || echo "⚠️ Patch partially failed, continuing..."
+            }
+          else
+            echo "⚠️ Patch for kernel $KVER not found, trying generic patch..."
+            ls /tmp/susfs4ksu/kernel_patches/
+          fi
+
+          # Copy susfs source files
+          cp /tmp/susfs4ksu/kernel_patches/fs/susfs.c "$KERNEL_DIR/fs/" 2>/dev/null || true
+          cp /tmp/susfs4ksu/kernel_patches/include/linux/susfs.h "$KERNEL_DIR/include/linux/" 2>/dev/null || true
+
+          # Apply KernelSU susfs patch
+          cd "$KERNEL_DIR/KernelSU"
+          if [ -f "10_enable_susfs_for_ksu.patch" ]; then
+            patch -p1 < 10_enable_susfs_for_ksu.patch || echo "⚠️ KSU susfs patch partially failed"
+          fi
+
+          echo "✅ SusFS integration done"
+
+      # ──────────────────────────────────────────
+      # 6. Cấu hình defconfig
+      # ──────────────────────────────────────────
+      - name: Configure defconfig
+        run: |
+          cd "$KERNEL_DIR"
+          mkdir -p "$OUT_DIR"
+
+          DEFCONFIG="${{ github.event.inputs.DEFCONFIG }}"
+          echo "Using defconfig: $DEFCONFIG"
+
+          # Kiểm tra defconfig tồn tại
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            echo "⚠️ $DEFCONFIG not found, listing available defconfigs:"
+            ls arch/arm64/configs/ | grep -i "defconfig" || true
+            echo "Trying to find suitable defconfig..."
+            # Tìm defconfig phù hợp
+            FOUND=$(ls arch/arm64/configs/ | grep -i "gki\|mt\|realme\|gt7" | head -1)
+            if [ -n "$FOUND" ]; then
+              echo "Found: $FOUND"
+              DEFCONFIG="$FOUND"
+            else
+              echo "Using gki_defconfig as fallback"
+              DEFCONFIG="gki_defconfig"
+            fi
+          fi
+
+          # Generate .config
+          make O="$OUT_DIR" \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            "$DEFCONFIG"
+
+          # Bật các config cần thiết cho ReSukiSU + SusFS
+          cat >> "$OUT_DIR/.config" << 'EOF'
+          CONFIG_KSU=y
+          CONFIG_KSU_DEBUG=n
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=n
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
+          EOF
+
+          # Sync config
+          make O="$OUT_DIR" \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          echo "✅ Defconfig configured"
+
+      # ──────────────────────────────────────────
+      # 7. Build Kernel
+      # ──────────────────────────────────────────
+      - name: Build kernel
+        run: |
+          cd "$KERNEL_DIR"
+
+          # Set ccache
+          export USE_CCACHE=1
+          export CCACHE_DIR="${{ github.workspace }}/.ccache"
+          ccache -M 5G
+
+          BUILD_START=$(date +%s)
+          echo "Build started at: $(date)"
+
+          # Build command
+          make O="$OUT_DIR" \
+            ARCH=arm64 \
+            CC=clang \
+            CXX=clang++ \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+            -j$(nproc --all) \
+            2>&1 | tee "${{ github.workspace }}/build.log"
+
+          BUILD_END=$(date +%s)
+          BUILD_DIFF=$((BUILD_END - BUILD_START))
+          echo "Build finished in $((BUILD_DIFF / 60)) minutes $((BUILD_DIFF % 60)) seconds"
+
+          # Kiểm tra Image
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            echo "✅ Image built successfully"
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image.gz" ]; then
+            echo "✅ Image.gz built successfully"
+            cp "$OUT_DIR/arch/arm64/boot/Image.gz" "$OUT_DIR/arch/arm64/boot/Image"
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+          else
+            echo "❌ Build FAILED - Image not found"
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            tail -100 "${{ github.workspace }}/build.log"
+            exit 1
+          fi
+
+          echo "BUILD_TIME=$((BUILD_DIFF / 60))m$((BUILD_DIFF % 60))s" >> $GITHUB_ENV
+
+      # ──────────────────────────────────────────
+      # 8. Clone AnyKernel3
+      # ──────────────────────────────────────────
+      - name: Clone AnyKernel3
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          git clone --depth=1 \
+            --branch "${{ github.event.inputs.ANYKERNEL_BRANCH }}" \
+            "${{ github.event.inputs.ANYKERNEL_SOURCE }}" \
+            "$ANYKERNEL_DIR"
+
+          # Xóa các file không cần thiết
+          rm -rf "$ANYKERNEL_DIR/.git"
+          rm -f "$ANYKERNEL_DIR/LICENSE" "$ANYKERNEL_DIR/README.md"
+
+      # ──────────────────────────────────────────
+      # 9. Tùy chỉnh anykernel.sh
+      # ──────────────────────────────────────────
+      - name: Configure AnyKernel3
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          DEVICE_CODENAME="gt7t"
+
+          cat > "$ANYKERNEL_DIR/anykernel.sh" << EOF
+          # AnyKernel3 - Script Properties
+          # Do not remove/modify the below line!
+          properties() { '
+          kernel.string=${{ github.event.inputs.KERNEL_NAME }} by GitHub Actions
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=RE58B2L1
+          device.name2=RE58B5L1
+          device.name3=gt7t
+          device.name4=RMX3921
+          device.name5=RMX3922
+          supported.versions=15
+          supported.patchlevels=
+          '; }
+
+          # Shell Variables
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          # Copy kernel image
+          cp "$OUT_DIR/arch/arm64/boot/Image" "$ANYKERNEL_DIR/"
+
+          # Copy DTB nếu có
+          if find "$OUT_DIR/arch/arm64/boot/dts" -name "*.dtb" 2>/dev/null | grep -q .; then
+            find "$OUT_DIR/arch/arm64/boot/dts" -name "*.dtb" \
+              -exec cat {} + > "$ANYKERNEL_DIR/dtb"
+            echo "✅ DTB appended"
+          fi
+
+          # Copy DTBO nếu có
+          if [ -f "$OUT_DIR/arch/arm64/boot/dtbo.img" ]; then
+            cp "$OUT_DIR/arch/arm64/boot/dtbo.img" "$ANYKERNEL_DIR/"
+            echo "✅ DTBO copied"
+          fi
+
+      # ──────────────────────────────────────────
+      # 10. Đóng gói AnyKernel3 zip
+      # ──────────────────────────────────────────
+      - name: Package AnyKernel3 zip
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          DATE=$(date +%Y%m%d-%H%M)
+          KVER="${{ github.event.inputs.KERNEL_VERSION }}"
+          KNAME="${{ github.event.inputs.KERNEL_NAME }}"
+          ZIP_NAME="${KNAME}-${KVER}-${DATE}.zip"
+
+          cd "$ANYKERNEL_DIR"
+          zip -r9 "${{ github.workspace }}/$ZIP_NAME" . \
+            -x "*.git*" \
+            -x "*placeholder*"
+
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "ZIP_PATH=${{ github.workspace }}/$ZIP_NAME" >> $GITHUB_ENV
+
+          # Info
+          ls -lh "${{ github.workspace }}/$ZIP_NAME"
+          echo "✅ AnyKernel3 zip created: $ZIP_NAME"
+
+      # ──────────────────────────────────────────
+      # 11. Upload artifact
+      # ──────────────────────────────────────────
+      - name: Upload AnyKernel3 zip
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 7
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ github.workspace }}/build.log
+          retention-days: 3
+
+      # ──────────────────────────────────────────
+      # 12. Tạo GitHub Release (tuỳ chọn)
+      # ──────────────────────────────────────────
+      - name: Create GitHub Release
+        if: env.BUILD_SUCCESS == 'true' && github.event.inputs.CREATE_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ github.run_number }}
+          name: "${{ github.event.inputs.KERNEL_NAME }} - Build #${{ github.run_number }}"
+          body: |
+            ## 🔧 Realme GT7T Custom Kernel
+
+            **Kernel Version:** ${{ github.event.inputs.KERNEL_VERSION }}
+            **ReSukiSU:** ✅ Integrated
+            **SusFS:** ✅ Integrated (${{ github.event.inputs.SUSFS_BRANCH }})
+            **Build Time:** ${{ env.BUILD_TIME }}
+            **Date:** ${{ env.DATE }}
+
+            ### ⚠️ Cách flash
+            1. Vào Recovery (TWRP / OrangeFox)
+            2. Flash file zip
+            3. Reboot
+
+            ### 📋 Thông tin
+            - Device: Realme GT7T (Dimensity 8400 Max)
+            - Android: 15 (Android V)
+            - Root: ReSukiSU + SusFS
+
+            > **Disclaimer:** Flash at your own risk!
+          files: ${{ env.ZIP_PATH }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ──────────────────────────────────────────
+      # 13. Summary
+      # ──────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "       BUILD SUMMARY"
+          echo "================================"
+          echo "Status   : ${{ env.BUILD_SUCCESS == 'true' && '✅ SUCCESS' || '❌ FAILED' }}"
+          echo "Kernel   : ${{ github.event.inputs.KERNEL_VERSION }}"
+          echo "ReSukiSU : ✅"
+          echo "SusFS    : ${{ github.event.inputs.SUSFS_BRANCH }}"
+          echo "Build    : ${{ env.BUILD_TIME }}"
+          if [ -n "${{ env.ZIP_NAME }}" ]; then
+            echo "Output   : ${{ env.ZIP_NAME }}"
+          fi
+          echo "================================"
